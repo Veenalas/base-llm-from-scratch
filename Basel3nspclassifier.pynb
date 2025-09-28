@@ -1,0 +1,463 @@
+
+# Basel III Transformer — Pretrain (Next-Word) → Finetune (Classification)
+
+**Author:** Veena  
+**Date:** 2025-09-28
+
+This notebook follows a *Raschka-style* flow:
+1. **Tokenizer**: tiny BPE (from scratch, simple/educational)
+2. **Model**: GPT-like mini Transformer (causal self-attention)
+3. **Phase 1**: Train on **next-word prediction** (language modeling)
+4. **Phase 2**: **Fine-tune** with a classification head on Basel III topics
+
+> Designed to be **audit-friendly** (readable code, minimal deps) and runnable on CPU.  
+> Replace toy texts with your Basel III corpus for real results.
+
+
+## 0. Setup
+
+
+!pip -q install torch --index-url https://download.pytorch.org/whl/cpu >/dev/null 2>&1 || echo "Torch preinstalled"
+import math, os, time, json, random
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+torch.manual_seed(42)
+np.random.seed(42)
+random.seed(42)
+
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+device
+
+
+## 1. Mini Basel III Corpus & Labels (Replace with your real data)
+
+
+# Load Basel III corpus from text file (one line per clause/paragraph)
+with open("basel3_corpus.txt", "r", encoding="utf-8") as f:
+    lm_texts = [ln.strip() for ln in f if ln.strip()]
+
+# Auto-label a subset for fine-tuning via simple keyword heuristics
+liquidity_kw = ["liquidity", "outflow", "stable funding", "nsfr", "lcr"]
+capital_kw   = ["capital", "tier one", "tier two", "rwa", "buffer", "conservation"]
+leverage_kw  = ["leverage", "exposure measure", "non risk based", "backstop"]
+
+def pick_label(text):
+    lo = text.lower()
+    if any(k in lo for k in liquidity_kw): return "Liquidity"
+    if any(k in lo for k in capital_kw):   return "Capital"
+    if any(k in lo for k in leverage_kw):  return "Leverage"
+    return None
+
+cls_pool = {"Liquidity":[], "Capital":[], "Leverage":[]}
+for t in lm_texts:
+    lab = pick_label(t)
+    if lab and len(cls_pool[lab]) < 60:  # cap per class for speed
+        cls_pool[lab].append(t)
+
+# Fallbacks if any class is short
+for k in cls_pool:
+    if len(cls_pool[k]) == 0:
+        cls_pool[k].append(lm_texts[0])
+
+cls_data = []
+for k in ["Liquidity","Capital","Leverage"]:
+    for s in cls_pool[k]:
+        cls_data.append((k, s))
+
+labels = sorted(set([lab for lab,_ in cls_data]))
+label_to_id = {lab:i for i,lab in enumerate(labels)}
+num_classes = len(labels)
+texts = lm_texts  # for embedding builds below
+labels, label_to_id, num_classes, len(lm_texts), len(cls_data)
+
+
+## 2. Tiny BPE Tokenizer (educational)
+
+
+from collections import Counter
+
+def text_to_symbols(text):
+    words = text.lower().split()
+    return [list(w) + ['</w>'] for w in words]
+
+def learn_bpe(corpus_texts, num_merges=200):
+    tokenized = [text_to_symbols(t) for t in corpus_texts]
+    merges = []
+    for _ in range(num_merges):
+        pair_counts = Counter()
+        for sent in tokenized:
+            for word in sent:
+                for i in range(len(word)-1):
+                    pair_counts[(word[i], word[i+1])] += 1
+        if not pair_counts:
+            break
+        best = max(pair_counts, key=pair_counts.get)
+        merges.append(best)
+        new_tokenized = []
+        for sent in tokenized:
+            new_sent = []
+            for word in sent:
+                i=0; merged=[]
+                while i < len(word):
+                    if i < len(word)-1 and (word[i], word[i+1]) == best:
+                        merged.append(word[i]+word[i+1]); i+=2
+                    else:
+                        merged.append(word[i]); i+=1
+                new_sent.append(merged)
+            new_tokenized.append(new_sent)
+        tokenized = new_tokenized
+    return merges
+
+def apply_bpe(text, merges):
+    words = text_to_symbols(text)
+    for a,b in merges:
+        new_words = []
+        for w in words:
+            i=0; merged=[]
+            while i < len(w):
+                if i < len(w)-1 and (w[i], w[i+1])==(a,b):
+                    merged.append(w[i]+w[i+1]); i+=2
+                else:
+                    merged.append(w[i]); i+=1
+            new_words.append(merged)
+        words = new_words
+    # flatten
+    out=[]; [out.extend(w) for w in words]
+    return out
+
+# Learn BPE merges from both LM and classification texts
+all_texts = lm_texts + [t for _,t in cls_data]
+merges = learn_bpe(all_texts, num_merges=250)
+
+# Build vocab
+vocab = set()
+for t in all_texts:
+    for tok in apply_bpe(t, merges):
+        vocab.add(tok)
+vocab = sorted(vocab)
+stoi = {tok:i+2 for i,tok in enumerate(vocab)}  # reserve 0,1
+itos = {i:t for t,i in stoi.items()}
+PAD=0; BOS=1
+
+len(vocab), list(stoi)[:10], PAD, BOS
+
+
+### Encode/Decode helpers
+
+
+def encode(text, add_bos=False):
+    toks = apply_bpe(text, merges)
+    ids = [stoi.get(t, PAD) for t in toks]
+    if add_bos:
+        ids = [BOS] + ids
+    return torch.tensor(ids, dtype=torch.long)
+
+def decode(ids):
+    toks = [itos.get(i, "<unk>") for i in ids if i>1]
+    return " ".join([t.replace("</w>", "") for t in toks])
+
+print(encode("Liquidity ratio must be >= threshold", add_bos=True)[:12])
+
+
+## 3. Datasets
+
+
+class LMDataset(Dataset):
+    def __init__(self, texts, block_size=64):
+        self.block_size = block_size
+        text = " ".join(texts)
+        ids = encode(text, add_bos=True)
+        self.data = ids
+
+    def __len__(self):
+        return max(1, len(self.data) - self.block_size)
+
+    def __getitem__(self, idx):
+        x = self.data[idx: idx+self.block_size]
+        y = self.data[idx+1: idx+self.block_size+1]
+        # pad last window if needed
+        if len(x) < self.block_size:
+            pad_len = self.block_size - len(x)
+            x = torch.cat([x, torch.full((pad_len,), PAD)])
+            y = torch.cat([y, torch.full((pad_len,), PAD)])
+        return x, y
+
+class CLSDataset(Dataset):
+    def __init__(self, pairs, block_size=64):
+        self.items = pairs
+        self.block_size = block_size
+    def __len__(self): return len(self.items)
+    def __getitem__(self, idx):
+        lab, txt = self.items[idx]
+        ids = encode(txt, add_bos=True)
+        ids = ids[:self.block_size]
+        if len(ids) < self.block_size:
+            ids = torch.cat([ids, torch.full((self.block_size-len(ids),), PAD)])
+        return ids, torch.tensor(label_to_id[lab], dtype=torch.long)
+
+block_size = 64
+lm_ds = LMDataset(lm_texts, block_size=block_size)
+cls_ds = CLSDataset(cls_data, block_size=block_size)
+len(lm_ds), len(cls_ds), block_size
+
+
+## 4. Mini GPT-like Transformer (causal)
+
+
+class TokenEmbedding(nn.Module):
+    def __init__(self, vocab_size, d_model):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size+2, d_model)  # +2 for PAD/BOS
+    def forward(self, x):
+        return self.embed(x)
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=512):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        pos = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+        self.register_buffer('pe', pe.unsqueeze(0))  # (1, max_len, d_model)
+    def forward(self, x):
+        return x + self.pe[:, :x.size(1), :]
+
+class MultiHeadSelfAttention(nn.Module):
+    def __init__(self, d_model=128, n_heads=4, dropout=0.1):
+        super().__init__()
+        assert d_model % n_heads == 0
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+        self.qkv = nn.Linear(d_model, 3*d_model, bias=False)
+        self.o = nn.Linear(d_model, d_model, bias=False)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x, mask=None):
+        B, T, C = x.size()
+        qkv = self.qkv(x)  # (B,T,3C)
+        q, k, v = qkv.chunk(3, dim=-1)
+        # Split heads
+        q = q.view(B, T, self.n_heads, self.d_head).transpose(1,2)  # (B,H,T,dh)
+        k = k.view(B, T, self.n_heads, self.d_head).transpose(1,2)
+        v = v.view(B, T, self.n_heads, self.d_head).transpose(1,2)
+        # Attention
+        scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.d_head)  # (B,H,T,T)
+        if mask is not None:
+            scores = scores.masked_fill(mask==0, float('-inf'))
+        w = F.softmax(scores, dim=-1)
+        w = self.drop(w)
+        out = w @ v   # (B,H,T,dh)
+        out = out.transpose(1,2).contiguous().view(B, T, C)
+        out = self.o(out)
+        return out
+
+class FeedForward(nn.Module):
+    def __init__(self, d_model=128, d_ff=256, dropout=0.1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d_model, d_ff),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_ff, d_model),
+            nn.Dropout(dropout),
+        )
+    def forward(self, x): return self.net(x)
+
+class Block(nn.Module):
+    def __init__(self, d_model=128, n_heads=4, d_ff=256, dropout=0.1):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(d_model)
+        self.attn = MultiHeadSelfAttention(d_model, n_heads, dropout)
+        self.ln2 = nn.LayerNorm(d_model)
+        self.ff = FeedForward(d_model, d_ff, dropout)
+    def forward(self, x, mask=None):
+        x = x + self.attn(self.ln1(x), mask=mask)
+        x = x + self.ff(self.ln2(x))
+        return x
+
+class GPTMini(nn.Module):
+    def __init__(self, vocab_size, d_model=128, n_heads=4, n_layers=4, d_ff=256, max_len=512, dropout=0.1):
+        super().__init__()
+        self.tok = TokenEmbedding(vocab_size, d_model)
+        self.pos = PositionalEncoding(d_model, max_len=max_len)
+        self.blocks = nn.ModuleList([Block(d_model, n_heads, d_ff, dropout) for _ in range(n_layers)])
+        self.ln_f = nn.LayerNorm(d_model)
+        self.head = nn.Linear(d_model, vocab_size+2, bias=False)  # LM head
+        self.max_len = max_len
+
+    def causal_mask(self, T):
+        # Lower-triangular causal mask (T,T) -> broadcast to (1,1,T,T)
+        mask = torch.tril(torch.ones(T, T, device=device)).unsqueeze(0).unsqueeze(0)
+        return mask
+
+    def forward(self, x):
+        B,T = x.size()
+        x = self.tok(x)
+        x = self.pos(x)
+        mask = self.causal_mask(T)
+        for blk in self.blocks:
+            x = blk(x, mask=mask)
+        x = self.ln_f(x)
+        logits = self.head(x)  # (B,T,V)
+        return logits
+
+
+## 5. Phase 1 — Train Next-Word Prediction (Language Modeling)
+
+
+batch_size = 32
+lm_loader = DataLoader(lm_ds, batch_size=batch_size, shuffle=True)
+
+model = GPTMini(vocab_size=len(vocab), d_model=128, n_heads=4, n_layers=3, d_ff=256, max_len=block_size, dropout=0.1).to(device)
+opt = torch.optim.AdamW(model.parameters(), lr=3e-4)
+
+train_losses = []
+epochs = 8
+for ep in range(epochs):
+    model.train()
+    running = 0.0
+    for x,y in lm_loader:
+        x,y = x.to(device), y.to(device)
+        logits = model(x)
+        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1), ignore_index=PAD)
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        opt.step()
+        running += loss.item()
+    avg = running / max(1, len(lm_loader))
+    train_losses.append(avg)
+    print(f"Epoch {ep+1}/{epochs} - LM loss: {avg:.4f}")
+
+plt.figure(figsize=(6,3))
+plt.plot(train_losses)
+plt.title("LM Training Loss (Next-Word Prediction)")
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+plt.tight_layout()
+plt.show()
+
+# quick sample generation
+def sample(model, prompt, max_new_tokens=20):
+    model.eval()
+    ids = encode(prompt, add_bos=True).unsqueeze(0).to(device)
+    for _ in range(max_new_tokens):
+        if ids.size(1) >= model.max_len:
+            break
+        with torch.no_grad():
+            logits = model(ids)
+            next_logits = logits[:, -1, :]
+            next_id = torch.argmax(next_logits, dim=-1, keepdim=True)
+            ids = torch.cat([ids, next_id], dim=1)
+    return decode(ids[0].tolist())
+
+print("Sample:", sample(model, "Liquidity coverage ratio", max_new_tokens=15))
+
+
+## 6. Phase 2 — Fine-tune for Topic Classification
+
+
+# Classification head: pool final hidden states (mean pool) → linear → classes
+class GPTForClassification(nn.Module):
+    def __init__(self, gpt, num_classes):
+        super().__init__()
+        self.gpt = gpt
+        self.cls = nn.Linear(gpt.head.out_features, num_classes)
+    def forward(self, x):
+        logits = self.gpt(x)        # (B,T,V)
+        # recover last hidden layer output before LM head
+        # We can modify GPTMini to return hidden states, but to keep simple,
+        # tap into gpt.ln_f output by recomputing forward partially:
+        B,T = x.size()
+        h = self.gpt.tok(x)
+        h = self.gpt.pos(h)
+        mask = self.gpt.causal_mask(T)
+        for blk in self.gpt.blocks:
+            h = blk(h, mask=mask)
+        h = self.gpt.ln_f(h)        # (B,T,C)
+        pooled = h.mean(dim=1)      # (B,C)
+        return self.cls(pooled)
+
+cls_loader = DataLoader(cls_ds, batch_size=8, shuffle=True)
+
+clf = GPTForClassification(model, num_classes).to(device)
+opt2 = torch.optim.AdamW(clf.parameters(), lr=5e-4)
+
+ep_losses = []
+clf_epochs = 30
+for ep in range(clf_epochs):
+    clf.train()
+    running=0.0
+    for x,y in cls_loader:
+        x,y = x.to(device), y.to(device)
+        logits = clf(x)
+        loss = F.cross_entropy(logits, y)
+        opt2.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(clf.parameters(), 1.0)
+        opt2.step()
+        running += loss.item()
+    avg = running/len(cls_loader)
+    ep_losses.append(avg)
+    if (ep+1)%5==0:
+        print(f"Epoch {ep+1}/{clf_epochs} - CLS loss: {avg:.4f}")
+
+plt.figure(figsize=(6,3))
+plt.plot(ep_losses)
+plt.title("Classification Fine-tune Loss")
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+plt.tight_layout()
+plt.show()
+
+# Evaluate on training set (toy)
+clf.eval()
+all_x = torch.stack([cls_ds[i][0] for i in range(len(cls_ds))]).to(device)
+all_y = torch.stack([cls_ds[i][1] for i in range(len(cls_ds))]).to(device)
+with torch.no_grad():
+    logits = clf(all_x)
+pred = logits.argmax(dim=1)
+acc = (pred==all_y).float().mean().item()
+print("Training accuracy (toy):", round(acc, 3))
+
+# Confusion matrix
+cm = torch.zeros(num_classes, num_classes, dtype=torch.int32)
+for i in range(len(all_y)):
+    cm[all_y[i], pred[i]] += 1
+plt.figure(figsize=(4,4))
+plt.imshow(cm, aspect='auto')
+plt.title("Confusion Matrix (Train)")
+plt.xlabel("Predicted")
+plt.ylabel("True")
+plt.xticks(range(num_classes), labels, rotation=45)
+plt.yticks(range(num_classes), labels)
+for i in range(num_classes):
+    for j in range(num_classes):
+        plt.text(j, i, int(cm[i,j].item()), ha='center', va='center')
+plt.tight_layout()
+plt.show()
+
+
+## 7. Save checkpoints (optional)
+
+
+os.makedirs("checkpoints", exist_ok=True)
+torch.save(model.state_dict(), "checkpoints/gptmini_lm.pt")
+torch.save(clf.state_dict(), "checkpoints/gptmini_cls.pt")
+print("Saved: checkpoints/gptmini_lm.pt and checkpoints/gptmini_cls.pt")
+
+
+
+## Notes & Next Steps
+- Replace the toy text with your Basel III corpus (ensure it's cleaned and legally usable).
+- Increase model capacity (`d_model`, `n_layers`, `block_size`) and training epochs for better results.
+- Add **eval splits** and metrics (precision/recall/F1) for a stronger LinkedIn claim.
+- Optional: unfreeze everything or partially freeze during fine-tuning; experiment with pooling (CLS token, last token, attention pooling).
+- For audits, log BPE merges, seeds, and config to a JSON.
